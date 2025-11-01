@@ -1,0 +1,342 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+import torchvision
+import torchvision.transforms as transforms
+import numpy as np
+import math
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# Modified MAGDrop class to track dropout rates
+class MAGDrop(nn.Module):
+    def __init__(self, base_p=0.2, beta=0.9, tau=0.05):
+        super().__init__()
+        self.base_p = base_p
+        self.beta = beta
+        self.tau = tau
+        self.momentum = None
+        self.grads = {}
+        self.accumulated_p = []  # Track dropout rates
+        self.hooks = []
+
+    def register_backward_hook(self, model):
+        """Register backward hooks to get gradients"""
+        def backward_hook(module, grad_input, grad_output):
+            if grad_output[0] is not None:
+                self.grads['current'] = grad_output[0].detach()
+            return grad_input
+
+        for module in model.modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                hook = module.register_full_backward_hook(backward_hook)
+                self.hooks.append(hook)
+
+    def forward(self, x):
+        if not self.training:
+            return x
+
+        if not self.grads:
+            return x
+
+        grad = self.grads.get('current', None)
+        if grad is None:
+            return x
+
+        if self.momentum is None:
+            self.momentum = grad.clone().detach()
+        else:
+            self.momentum = self.beta * self.momentum + (1 - self.beta) * grad.detach()
+
+        # Compute norms per sample then average
+        grad_flat = grad.view(grad.size(0), -1)
+        mom_flat = self.momentum.view(self.momentum.size(0), -1)
+
+        grad_norm = torch.norm(grad_flat, dim=1).mean()
+        mom_norm = torch.norm(mom_flat, dim=1).mean()
+        diff_norm = torch.norm(grad_flat - mom_flat, dim=1).mean()
+
+        p = self.base_p * (mom_norm / (grad_norm + 1e-8)) * torch.sigmoid(diff_norm / self.tau)
+        p = p.clamp(0, 0.6)
+
+        # Track dropout rate
+        self.accumulated_p.append(p.item())
+
+        # Create mask with proper broadcasting
+        mask = torch.bernoulli(torch.ones_like(x) * (1 - p))
+        return x * mask / (1 - p + 1e-8)
+
+# Simple CNN model for quick testing
+class SimpleCNN(nn.Module):
+    def __init__(self, num_classes=10, method='none'):
+        super().__init__()
+        self.method = method
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((4, 4))
+        )
+        self.classifier = nn.Linear(64 * 4 * 4, num_classes)
+
+        self.reg = None
+        if method == 'magdrop':
+            self.reg = MAGDrop(base_p=0.2, tau=0.05)
+            self.reg.register_backward_hook(self)
+        elif method == 'dropout':
+            self.reg = nn.Dropout(0.3)
+
+    def forward(self, x):
+        x = self.features(x)
+        if self.reg is not None and self.training:
+            x = self.reg(x)
+        x = x.view(x.size(0), -1)
+        x = self.classifier(x)
+        return x
+
+# Get CIFAR-10 dataloaders
+def get_cifar10_dataloaders(batch_size=128):
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+    ])
+
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+    ])
+
+    trainset = torchvision.datasets.CIFAR10(
+        root='./data', train=True, download=True, transform=transform_train)
+    testset = torchvision.datasets.CIFAR10(
+        root='./data', train=False, download=True, transform=transform_test)
+
+    train_loader = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=2)
+    test_loader = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=2)
+
+    return train_loader, test_loader
+
+# Training function
+def train_model(model, train_loader, test_loader, num_epochs=5):
+    """Quick training to get reasonable weights"""
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss()
+
+    model.train()
+    for epoch in range(num_epochs):
+        for batch_idx, (data, target) in enumerate(train_loader):
+            if batch_idx > 50:  # Quick training for demo
+                break
+
+            data, target = data.to(device), target.to(device)
+            optimizer.zero_grad()
+
+            output = model(data)
+            loss = criterion(output, target)
+            loss.backward()
+
+            optimizer.step()
+
+        # Quick validation
+        model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for data, target in test_loader:
+                data, target = data.to(device), target.to(device)
+                output = model(data)
+                pred = output.argmax(dim=1)
+                correct += (pred == target).sum().item()
+                total += target.size(0)
+        acc = 100 * correct / total
+        print(f'Epoch {epoch+1}/{num_epochs}, Test Acc: {acc:.2f}%')
+        model.train()
+
+    return model
+
+# PAC-Bayes measurement function
+def compute_pac_bayes_measures(model, train_loader):
+    """Compute actual measurements for PAC-Bayes bound"""
+    model.eval()
+
+    print("\nComputing PAC-Bayes measurements...")
+
+    # 1. Compute E[||w||^2] - weight norm squared
+    total_norm_squared = 0.0
+    for param in model.parameters():
+        if param.requires_grad:
+            total_norm_squared += torch.norm(param).item() ** 2
+    E_w2 = total_norm_squared
+    print(f"E[||w||^2]: {E_w2:.2f}")
+
+    # 2. Compute average dropout rate E[p_t]
+    if hasattr(model, 'reg') and model.reg is not None and hasattr(model.reg, 'accumulated_p'):
+        E_pt = np.mean(model.reg.accumulated_p) if model.reg.accumulated_p else 0.2
+        print(f"Average dropout rate E[p_t]: {E_pt:.3f}")
+        print(f"Number of dropout measurements: {len(model.reg.accumulated_p)}")
+    else:
+        E_pt = 0.3  # Standard dropout
+        print(f"Using default dropout rate: {E_pt:.3f}")
+
+    # 3. Compute spectral norms and sum term: sum_l κ_l * sqrt(E[p_t])
+    sum_sqrt_p_kappa = 0.0
+    layer_count = 0
+
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Conv2d, nn.Linear)):
+            layer_count += 1
+            # Compute spectral norm using SVD
+            W = module.weight.data
+            if isinstance(module, nn.Conv2d):
+                # Reshape Conv2d weights to a matrix for SVD
+                W = W.view(W.shape[0], -1)
+
+            if W.shape[0] > 0 and W.shape[1] > 0:
+                try:
+                    # Compute SVD
+                    _, S, _ = torch.linalg.svd(W, full_matrices=False)
+                    spectral_norm = S[0].item() # Largest singular value
+                except:
+                     # Fallback to Frobenius norm if SVD fails or is not applicable
+                    spectral_norm = torch.norm(W).item()
+                    print(f"Warning: SVD failed for layer {name}. Using Frobenius norm as approximation.")
+
+            else:
+                 # Handle layers with 0 dimensions if necessary
+                 spectral_norm = 0.0
+                 print(f"Warning: Layer {name} has zero dimension weights. Spectral norm set to 0.")
+
+
+            contribution = spectral_norm * math.sqrt(E_pt)
+            sum_sqrt_p_kappa += contribution
+            # print(f"Layer {layer_count}: spectral_norm={spectral_norm:.2f}, contribution={contribution:.2f}")
+
+    print(f"Sum term ∑κ_l√E[p_t]: {sum_sqrt_p_kappa:.2f} (over {layer_count} layers)")
+
+    # 4. Compute empirical risk hat_R(h)
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for data, target in train_loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            pred = output.argmax(dim=1)
+            correct += (pred == target).sum().item()
+            total += target.size(0)
+            if total > 1000:  # Use subset for quick computation
+                break
+
+    train_accuracy = correct / total
+    hat_r = 1 - train_accuracy  # Empirical risk
+
+    print(f"Train accuracy: {train_accuracy:.4f}")
+    print(f"Empirical risk hat_R(h): {hat_r:.4f}")
+
+    return {
+        'E_w2': E_w2,
+        'E_pt': E_pt,
+        'sum_sqrt_p_kappa': sum_sqrt_p_kappa,
+        'hat_r': hat_r,
+        'train_accuracy': train_accuracy
+    }
+
+# PAC-Bayes bound computation
+def compute_pac_bayes_bound(measures, m=50000, delta=0.05, sigma2=1.0, alpha=0.5, c=2*math.log(2), B=1.0, X2=3072.0):
+    """
+    Compute the non-asymptotic PAC-Bayes bound
+    """
+    E_w2 = measures['E_w2']
+    E_pt = measures['E_pt']
+    sum_sqrt_p_kappa = measures['sum_sqrt_p_kappa']
+    hat_r = measures['hat_r']
+
+    # Compute bound terms
+    kl_term1 = (1 / (2 * sigma2)) * E_w2
+    kl_term2 = math.log(1 / (alpha * (1 - E_pt)))
+    kl_term3 = math.log(m / delta)
+    pert_term = c * B**2 * X2 * math.exp(sum_sqrt_p_kappa)
+
+    numerator = kl_term1 + kl_term2 + kl_term3 + pert_term
+
+    # Ensure numerator is non-negative before taking sqrt
+    if numerator < 0:
+        print(f"Warning: Numerator for bound computation is negative ({numerator:.4f}). Clamping to 0.")
+        numerator = 0.0
+
+    bound_value = hat_r + math.sqrt(numerator / (2 * m))
+
+    print(f"\nBound computation:")
+    print(f"KL term 1: {kl_term1:.4f}")
+    print(f"KL term 2: {kl_term2:.4f}")
+    print(f"KL term 3: {kl_term3:.4f}")
+    print(f"Perturbation term: {pert_term:.4f}")
+    print(f"Numerator: {numerator:.4f}")
+    print(f"Final bound: {bound_value:.4f}")
+
+    return bound_value
+
+# Main execution
+def main():
+    print("=== PAC-Bayes Bound Measurement ===")
+
+    # Get data
+    train_loader, test_loader = get_cifar10_dataloaders(batch_size=128)
+
+    # Train and measure MAGDrop model
+    print("\n" + "="*50)
+    print("Training MAGDrop model...")
+    magdrop_model = SimpleCNN(num_classes=10, method='magdrop').to(device)
+    magdrop_model = train_model(magdrop_model, train_loader, test_loader, num_epochs=3)
+
+    magdrop_measures = compute_pac_bayes_measures(magdrop_model, train_loader)
+    magdrop_bound = compute_pac_bayes_bound(magdrop_measures)
+
+    # Train and measure Standard Dropout model
+    print("\n" + "="*50)
+    print("Training Standard Dropout model...")
+    dropout_model = SimpleCNN(num_classes=10, method='dropout').to(device)
+    dropout_model = train_model(dropout_model, train_loader, test_loader, num_epochs=3)
+
+    dropout_measures = compute_pac_bayes_measures(dropout_model, train_loader)
+    dropout_bound = compute_pac_bayes_bound(dropout_measures)
+
+    # Results comparison
+    print("\n" + "="*50)
+    print("=== FINAL RESULTS ===")
+    print(f"{'Method':<15} {'E[||w||²]':<10} {'E[p_t]':<8} {'∑κ√p':<8} {'Bound':<8} {'Improvement':<12}")
+    print("-" * 65)
+
+    improvement = ((dropout_bound - magdrop_bound) / dropout_bound) * 100
+
+    print(f"{'MAGDrop':<15} {magdrop_measures['E_w2']:<10.1f} {magdrop_measures['E_pt']:<8.3f} "
+          f"{magdrop_measures['sum_sqrt_p_kappa']:<8.2f} {magdrop_bound:<8.3f} {improvement:>6.1f}%")
+    print(f"{'Std Dropout':<15} {dropout_measures['E_w2']:<10.1f} {dropout_measures['E_pt']:<8.3f} "
+          f"{dropout_measures['sum_sqrt_p_kappa']:<8.2f} {dropout_bound:<8.3f} {'--':>12}")
+
+    # Create LaTeX table
+    print("\n=== LaTeX Table ===")
+    print("\\begin{table}[h]")
+    print("    \\centering")
+    print("    \\caption{Numerical Comparison of PAC-Bayes Bounds on CIFAR-10}")
+    print("    \\label{tab:bounds}")
+    print("    \\begin{tabular}{lcccc}")
+    print("        \\toprule")
+    print("        Method & $\\mathbb{E}[\\|w\\|^2]$ & $\\mathbb{E}[p_t]$ & $\\sum_l \\kappa_l\\sqrt{p_{t,l}}$ & Bound \\\\")
+    print("        \\midrule")
+    print(f"        Standard Dropout & {dropout_measures['E_w2']:.1f} & {dropout_measures['E_pt']:.3f} & {dropout_measures['sum_sqrt_p_kappa']:.2f} & {dropout_bound:.3f} \\\\")
+    print(f"        MAGDrop (Ours) & {magdrop_measures['E_w2']:.1f} & {magdrop_measures['E_pt']:.3f} & {magdrop_measures['sum_sqrt_p_kappa']:.2f} & {magdrop_bound:.3f} \\\\")
+    print("        \\bottomrule")
+    print("    \\end{tabular}")
+    print("\\end{table}")
+
+    print(f"\nBound improvement: {improvement:.1f}%")
+
+if __name__ == "__main__":
+    main()

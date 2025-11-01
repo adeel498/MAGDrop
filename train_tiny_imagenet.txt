@@ -1,0 +1,148 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import torchvision.transforms as transforms
+from torchvision.models.resnet import ResNet, Bottleneck
+from torch.cuda.amp import autocast, GradScaler
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import os, requests, zipfile
+from PIL import Image
+
+# ✅ Step 1: Download + extract Tiny ImageNet automatically
+def download_tiny_imagenet(root="./data"):
+    os.makedirs(root, exist_ok=True)
+    url = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
+    zip_path = os.path.join(root, "tiny-imagenet-200.zip")
+    extract_path = os.path.join(root, "tiny-imagenet-200")
+
+    if not os.path.exists(extract_path):
+        if not os.path.exists(zip_path):
+            print("⬇️ Downloading Tiny ImageNet (250MB)...")
+            r = requests.get(url, stream=True)
+            with open(zip_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024*1024):
+                    if chunk:
+                        f.write(chunk)
+            print("✅ Download complete.")
+        print("📦 Extracting...")
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(root)
+        print("✅ Extraction complete.")
+    else:
+        print("✔️ Dataset already exists, skipping download.")
+
+    return extract_path
+
+
+# ✅ Step 2: Dataset class
+class TinyImageNet(torch.utils.data.Dataset):
+    def __init__(self, root, train=True, transform=None):
+        self.root = root
+        self.transform = transform
+        self.train = train
+        self.classes = sorted(os.listdir(os.path.join(root, 'train')))
+        self.class_to_idx = {cls: i for i, cls in enumerate(self.classes)}
+        if train:
+            self.images, self.labels = [], []
+            for cls in self.classes:
+                images_dir = os.path.join(root, 'train', cls, 'images')
+                for img in os.listdir(images_dir):
+                    self.images.append(os.path.join(images_dir, img))
+                    self.labels.append(self.class_to_idx[cls])
+        else:
+            val_file = os.path.join(root, 'val', 'val_annotations.txt')
+            self.images, self.labels = [], []
+            with open(val_file, 'r') as f:
+                for line in f:
+                    img, cls = line.strip().split('\t')[:2]
+                    self.images.append(os.path.join(root, 'val', 'images', img))
+                    self.labels.append(self.class_to_idx[cls])
+
+    def __len__(self): return len(self.images)
+    def __getitem__(self, idx):
+        img = Image.open(self.images[idx]).convert('RGB')
+        label = self.labels[idx]
+        if self.transform: img = self.transform(img)
+        return img, label
+
+
+# ✅ Step 3: Plain ResNet-50
+class PlainResNet(ResNet):
+    def __init__(self, num_classes=200, in_channels=3):
+        super().__init__(Bottleneck, [3, 4, 6, 3], num_classes=num_classes)
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+
+
+# ✅ Step 4: Training loop
+def train_baseline(root, epochs=10):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Device:", device)
+
+    transform_train = transforms.Compose([
+        transforms.RandomResizedCrop(64),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(0.2,0.2,0.2),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4802,0.4481,0.3975),(0.2770,0.2691,0.2821))
+    ])
+    transform_test = transforms.Compose([
+        transforms.CenterCrop(64),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4802,0.4481,0.3975),(0.2770,0.2691,0.2821))
+    ])
+
+    train_set = TinyImageNet(root, train=True, transform=transform_train)
+    test_set  = TinyImageNet(root, train=False, transform=transform_test)
+    train_loader = DataLoader(train_set, batch_size=64, shuffle=True, num_workers=4, pin_memory=True)
+    test_loader  = DataLoader(test_set, batch_size=256, shuffle=False, num_workers=4, pin_memory=True)
+
+    model = PlainResNet(num_classes=200).to(device)
+    optimizer = optim.SGD(model.parameters(), lr=0.05, momentum=0.9, weight_decay=1e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
+    criterion = nn.CrossEntropyLoss()
+    scaler = GradScaler()
+
+    for epoch in range(1, epochs+1):
+        # Training
+        model.train()
+        correct, total = 0, 0
+        for data, target in train_loader:
+            data, target = data.to(device), target.to(device)
+            optimizer.zero_grad()
+            with autocast():
+                output = model(data)
+                loss = criterion(output, target)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            pred = output.argmax(dim=1)
+            correct += pred.eq(target).sum().item()
+            total += data.size(0)
+        train_acc = correct / total
+
+        # Validation
+        model.eval()
+        test_correct, test_total = 0, 0
+        with torch.no_grad():
+            for data, target in test_loader:
+                data, target = data.to(device), target.to(device)
+                output = model(data)
+                pred = output.argmax(dim=1)
+                test_correct += pred.eq(target).sum().item()
+                test_total += data.size(0)
+        test_acc = test_correct / test_total
+        gen_gap = train_acc - test_acc
+
+        print(f"Epoch {epoch:02d}: Train {train_acc:.4f}, Test {test_acc:.4f}, Gap {gen_gap:.4f}")
+        scheduler.step()
+
+
+# ✅ Run everything
+if __name__ == "__main__":
+    dataset_root = download_tiny_imagenet()
+    train_baseline(dataset_root, epochs=20)  # change epochs as needed
+
