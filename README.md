@@ -14,6 +14,12 @@ pip install -r requirements.txt
 
 This reproduces the PAC-Bayes bound computation showing 29.2% improvement over standard dropout.
 
+---> train_cifar10.txt
+
+Run comprehensive CIFAR-10 experiments comparing MAGDrop against baseline regularization methods
+
+
+
 ---> train_tiny_imagenet.py
 
 It reproduces our Tiny ImageNet results for Table 3.
